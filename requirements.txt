@@ -1,0 +1,16 @@
+# KonaBess PC 依赖说明
+#
+# 运行程序本身不需要任何第三方库（仅使用 Python 标准库 + tkinter）。
+#
+# 以下为可选依赖：
+
+# 处理 LZ4 压缩的内核镜像（部分机型的 kernel 内嵌 DTB）
+lz4>=4.0
+
+# 处理 Zstandard 压缩的内核镜像
+# （Python 3.14+ 已内置 compression.zstd，无需安装）
+zstandard>=0.22; python_version < "3.14"
+
+# 构建 / 开发工具（可选，用于生成图标与打包 exe）
+# pillow>=10.0
+# pyinstaller>=6.0

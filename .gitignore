@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 测试临时文件
+tests/_tmp/
+
+# 参考项目副本（可安全删除）
+_reference/
+
+# IDE
+.vscode/
+.idea/
