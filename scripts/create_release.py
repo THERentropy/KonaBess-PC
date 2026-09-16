@@ -15,25 +15,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 REPO = "THERentropy/KonaBess-PC"
-TAG = "v1.0.0"
+TAG = "v1.0.1"
 EXE = ROOT / "dist" / "KonaBessPC.exe"
 
-NOTES = """## KonaBess PC 1.0.0
+NOTES = """## KonaBess PC 1.0.1 — 关键修复版本
 
-骁龙 GPU 频率 / 电压表桌面编辑器（Windows），参考 [KonaBess Next](https://github.com/KonaBess-Next/KonaBess-Next) 实现。无需安装 Python，无需 magiskboot / dtc。
+骁龙 GPU 频率 / 电压表桌面编辑器（Windows），参考 [KonaBess Next](https://github.com/KonaBess-Next/KonaBess-Next) 实现。
 
-### 下载
+> **重要提示：请勿使用 v1.0.0 导出的镜像刷机。** v1.0.0 在处理部分厂商（如小米）的 vendor_boot v4 布局时，会丢失 bootconfig、vbmeta 与 AVB 尾部数据，导出的镜像无法正确启动。请使用本版本重新导出。
 
-- `KonaBessPC.exe` —— 单文件可执行程序（约 11.5 MB），下载后直接运行
+### 本版本修复
+
+- **vendor_boot v4 布局兼容性**：兼容表（vendor_ramdisk_table）位于 DTB 之后的厂商布局（小米等），表项不再被误判为独立 ramdisk 段
+- **尾部数据完整保留**：vbmeta、0 填充与 AVB footer 原样保留在输出镜像中，文件大小与结构与原镜像一致
+- **未修改内容字节级不变**：未编辑的设备树保持原始字节输出，无编辑保存 = 与原文件完全一致
+- **新增 AVB 提示**：保存带 AVB 签名的镜像时提醒签名校验失效风险
 
 ### 功能
 
 - 打开 `boot.img` / `vendor_boot.img` / `dtbo.img` / `.dtb` / `.dts`，自动识别芯片与 GPU 频率表（骁龙 855 → 8 Elite Gen 5）
 - 图形化编辑频率 / 电压档位 / 总线档位，添加、复制、删除等级（自动维护指针）
-- 独立电压表（OPP table）编辑
-- 调频曲线可视化，双击数据点直接编辑
-- 撤销 / 重做（100 步）、调参方案 JSON 导入导出
-- 导出 DTS / DTB / 可刷入镜像
+- 独立电压表（OPP table）编辑、调频曲线可视化（双击数据点编辑）
+- 撤销 / 重做（100 步）、调参方案 JSON 导入导出、导出 DTS / DTB
 - 深色主题，支持高 DPI 显示
 
 ### 使用

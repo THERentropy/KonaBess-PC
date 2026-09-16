@@ -100,6 +100,9 @@ class PackedImage:
     page_size: int = 4096
     header_version: int = 0
     raw_header: bytes = b""
+    #: 最后一个已知段之后的所有数据（0 填充、vbmeta、AVB footer 等），
+    #: 重组时原样追加，保证未修改区域字节级不变。
+    trailer: bytes = b""
     meta: dict = field(default_factory=dict)
 
     # -- 查询 ------------------------------------------------------------
@@ -193,12 +196,14 @@ def _parse_boot_legacy(data: bytes, version: int) -> PackedImage:
     img.meta["tags_addr"] = _u32le(data, 32)
     img.meta["os_version"] = _u32le(data, 44)
 
+    last_end = page
     for name, size, _aligned in sections:
         seg = Segment(name=name, offset=pos, data=bytes(data[pos:pos + size]))
         if size and len(seg.data) != size:
             seg.data = seg.data + b"\x00" * (size - len(seg.data))
         img.segments.append(seg)
         pos = align(pos + size, page)
+        last_end = pos
 
     # 某些 v2 镜像 header 中的 dtb_size 为 0，但文件尾部实际带 DTB，做兜底探测
     if version >= 2 and not img.segment("dtb").data:
@@ -206,7 +211,13 @@ def _parse_boot_legacy(data: bytes, version: int) -> PackedImage:
         if found is not None:
             offset, size = found
             img.segments = [s for s in img.segments if s.name != "dtb"]
-            img.segments.append(Segment(name="dtb", offset=offset, data=bytes(data[offset:offset + size])))
+            seg = Segment(name="dtb", offset=offset, data=bytes(data[offset:offset + size]))
+            img.segments.append(seg)
+            last_end = align(offset + size, page)
+
+    # 尾部数据（0 填充 / AVB footer 等）原样保留
+    if last_end < len(data):
+        img.trailer = bytes(data[last_end:])
     return img
 
 
@@ -230,11 +241,17 @@ def _parse_boot_v3v4(data: bytes, version: int) -> PackedImage:
     img.segments.append(Segment("ramdisk", bytes(data[ramdisk_off:ramdisk_off + ramdisk_size]), ramdisk_off))
 
     # v4 之后可能有 boot signature（16KB），保留
-    sig_off = align(ramdisk_off + ramdisk_size, page)
+    last_end = align(ramdisk_off + ramdisk_size, page)
+    sig_off = last_end
     if sig_off + 16 <= len(data) and data[sig_off:sig_off + 8] == BOOT_SIGNATURE_MAGIC:
         sig_size = _u32le(data, sig_off + 8)
         if 0 < sig_size <= len(data) - sig_off:
             img.segments.append(Segment("boot_signature", bytes(data[sig_off:sig_off + sig_size]), sig_off))
+            last_end = align(sig_off + sig_size, page)
+
+    # 尾部数据（0 填充 / AVB footer 等）原样保留
+    if last_end < len(data):
+        img.trailer = bytes(data[last_end:])
     return img
 
 
@@ -291,7 +308,9 @@ def _pack_boot_legacy(img: PackedImage) -> bytes:
     if img.header_version >= 2:
         place("dtb", 1648, (1652, "dtb_addr", True))
 
+    # 尾部（0 填充 / AVB footer 等）原样追加
     _pad_to_page(out, page)
+    out.extend(img.trailer)
     return bytes(out)
 
 
@@ -321,6 +340,7 @@ def _pack_boot_v3v4(img: PackedImage) -> bytes:
         sig.offset = len(out)
         out.extend(sig.data)
         _pad_to_page(out, page)
+    out.extend(img.trailer)
     return bytes(out)
 
 
@@ -356,7 +376,6 @@ def _parse_vendor_boot(data: bytes) -> PackedImage:
     ramdisk_off = align(header_size, page)
     img.segments.append(Segment("vendor_ramdisk", bytes(data[ramdisk_off:ramdisk_off + vendor_ramdisk_size]), ramdisk_off))
 
-    table_seg = None
     if version == 4:
         table_size = _u32le(data, 2112)
         entry_num = _u32le(data, 2116)
@@ -365,51 +384,128 @@ def _parse_vendor_boot(data: bytes) -> PackedImage:
         img.meta["bootconfig_size"] = bootconfig_size
         if entry_size == 0:
             entry_size = VENDOR_RAMDISK_TABLE_ENTRY_SIZE_V4
-        table_off = _locate_vendor_ramdisk_table(data, ramdisk_off + vendor_ramdisk_size, entry_num, entry_size)
-        table_data = bytes(data[table_off:table_off + table_size])
-        table_seg = Segment("vendor_ramdisk_table", table_data, table_off)
-        img.segments.append(table_seg)
-        img.meta["table_entry_size"] = entry_size
 
-        # ramdisk fragments（每个 fragment 的 offset 记录在表项中）
-        last_end = table_off + table_size
+        ramdisk_end = ramdisk_off + vendor_ramdisk_size
+
+        # 1) 先定位 dtb 段：从 ramdisk 结束后按页扫描第一个合法 FDT
+        #    （不依赖 table 位置，兼容 table 在 ramdisk 后或 dtb 后两种布局）
+        dtb_off = _scan_dtb_page_aligned(data, ramdisk_end, dtb_size, page)
+        dtb_end = dtb_off + dtb_size if dtb_size else ramdisk_end
+
+        # 2) 定位 vendor_ramdisk 表：
+        #    - AOSP 标准布局：紧跟 vendor_ramdisk（无对齐）
+        #    - 部分厂商（如小米）：位于 dtb 段之后的页对齐处
+        #    通过验证表项合理性选择（全 0 的填充不会被误判为表）
+        table_off = ramdisk_end
+        for candidate in (ramdisk_end, align(dtb_end, page), align(ramdisk_end, page)):
+            if _validate_table_entry(data, candidate, entry_size):
+                table_off = candidate
+                break
+        table_data = bytes(data[table_off:table_off + table_size])
+        img.meta["table_entry_size"] = entry_size
+        img.meta["table_follows_ramdisk"] = table_off == ramdisk_end
+
+        # 按布局顺序收集 body 段（排序后再加入，决定 pack 时的布局顺序）
+        body: list[Segment] = [Segment("vendor_ramdisk_table", table_data, table_off)]
+
+        # 3) ramdisk fragments：只收集位于表之后的独立数据段
+        #    （部分厂商的表项指向主 ramdisk 或分区开头，属于描述性记录而非独立段）
+        fragment_end = table_off + table_size
         for i in range(min(entry_num, table_size // entry_size if entry_size else 0)):
             base = i * entry_size
             r_size, r_offset, r_type = struct.unpack_from("<III", table_data, base)
+            if r_size == 0 or r_offset + r_size > len(data):
+                continue
+            if r_offset < fragment_end:
+                continue
             name_raw = table_data[base + 12:base + 44]
             board_raw = table_data[base + 44:base + 108]
-            seg = Segment("ramdisk_fragment_%d" % i,
-                          bytes(data[r_offset:r_offset + r_size]), r_offset,
-                          meta={"type": r_type, "name_raw": name_raw, "board_raw": board_raw})
-            img.segments.append(seg)
-            last_end = max(last_end, r_offset + r_size)
+            body.append(Segment("ramdisk_fragment_%d" % i,
+                                bytes(data[r_offset:r_offset + r_size]), r_offset,
+                                meta={"type": r_type, "name_raw": name_raw, "board_raw": board_raw}))
+            fragment_end = max(fragment_end, r_offset + r_size)
 
-        dtb_off = _locate_dtb_after(data, last_end, dtb_size, page)
+        # 4) bootconfig：从 dtb 结束之后按页扫描，
+        #    要求内容像 key=value 文本（避免把表或填充误判为 bootconfig）
+        search_from = dtb_end if dtb_size else fragment_end
+        content_end = search_from
+        if bootconfig_size:
+            bc_off = _scan_bootconfig(data, search_from, bootconfig_size, page)
+            if bc_off is not None:
+                body.append(Segment("bootconfig", bytes(data[bc_off:bc_off + bootconfig_size]), bc_off))
+                content_end = bc_off + bootconfig_size
 
-        if dtb_size and bootconfig_size:
-            bc_off = _locate_bootconfig(data, dtb_off + dtb_size, bootconfig_size, page)
-            if 0 < bc_off <= len(data) - bootconfig_size:
-                img.segments.append(Segment("bootconfig", bytes(data[bc_off:bc_off + bootconfig_size]), bc_off))
+        # 5) dtb 段
+        if dtb_size:
+            body.append(Segment("dtb", bytes(data[dtb_off:dtb_off + dtb_size]), dtb_off))
+
+        # 按原始偏移排序后依次加入（决定 pack 时的布局顺序）
+        img.segments.extend(sorted(body, key=lambda seg: seg.offset))
+
+        # 6) 尾部数据（vbmeta / 0 填充 / AVB footer 等）原样保留
+        content_end = max(content_end, fragment_end, dtb_end)
+        trailer_start = align(content_end, page)
+        if trailer_start < len(data):
+            img.trailer = bytes(data[trailer_start:])
     else:
         dtb_off = _locate_dtb_after(data, ramdisk_off + vendor_ramdisk_size, dtb_size, page)
-
-    if dtb_size:
-        img.segments.append(Segment("dtb", bytes(data[dtb_off:dtb_off + dtb_size]), dtb_off))
+        if dtb_size:
+            img.segments.append(Segment("dtb", bytes(data[dtb_off:dtb_off + dtb_size]), dtb_off))
+        trailer_start = align(dtb_off + dtb_size, page)
+        if trailer_start < len(data):
+            img.trailer = bytes(data[trailer_start:])
 
     return img
 
 
-def _locate_vendor_ramdisk_table(data: bytes, expected: int, entry_num: int, entry_size: int) -> int:
-    """定位 vendor_ramdisk 表：优先使用公式位置，否则在附近校验字段合理性。"""
-    candidates = [expected]
-    candidates.append(align(expected, 4096))
-    for off in candidates:
-        if off + 12 > len(data):
-            continue
-        size, num, esize = struct.unpack_from("<III", data, off)
-        if 0 < num <= 4096 and 0 < esize <= 4096 and size == num * esize:
-            return off
-    return expected
+def _scan_dtb_page_aligned(data: bytes, search_from: int, dtb_size: int, page: int) -> int:
+    """从 search_from 起按页对齐扫描第一个合法 FDT（用于 vendor_boot 的 dtb 段）。"""
+    if not dtb_size:
+        return align(search_from, page)
+    pos = align(search_from, page)
+    while pos + 40 <= len(data):
+        if is_fdt_magic(data, pos):
+            (totalsize,) = struct.unpack_from(">I", data, pos + 4)
+            if 40 <= totalsize <= dtb_size:
+                return pos
+        pos += page
+    return align(search_from, page)
+
+
+def _validate_table_entry(data: bytes, offset: int, entry_size: int) -> bool:
+    """验证 offset 处是否是合理的 vendor_ramdisk 表项（排除 0 填充等假表）。"""
+    if offset + 12 > len(data):
+        return False
+    size, ramdisk_offset, rtype = struct.unpack_from("<III", data, offset)
+    if size == 0 or size > len(data):
+        return False
+    if ramdisk_offset > len(data):
+        return False
+    if rtype > VENDOR_RAMDISK_TYPE_DLKM:
+        return False
+    name = data[offset + 12:offset + 44]
+    for byte in name:
+        if byte != 0 and (byte < 32 or byte > 126):
+            return False
+    return True
+
+
+def _scan_bootconfig(data: bytes, search_from: int, bootconfig_size: int, page: int) -> Optional[int]:
+    """从 search_from 起按页对齐扫描 bootconfig（内容需像 key=value 文本）。"""
+    pos = align(search_from, page)
+    limit = len(data) - bootconfig_size
+    while pos <= limit:
+        chunk = data[pos:pos + bootconfig_size]
+        if chunk and _looks_like_bootconfig(chunk):
+            return pos
+        pos += page
+    return None
+
+
+def _looks_like_bootconfig(chunk: bytes) -> bool:
+    """bootconfig 是 key=value\\n 文本，检查可打印字符占比。"""
+    printable = sum(1 for byte in chunk if 32 <= byte < 127 or byte in (10, 13))
+    return printable / len(chunk) > 0.7
 
 
 def _locate_dtb_after(data: bytes, expected: int, dtb_size: int, page: int) -> int:
@@ -429,17 +525,6 @@ def _locate_dtb_after(data: bytes, expected: int, dtb_size: int, page: int) -> i
     return expected
 
 
-def _locate_bootconfig(data: bytes, after: int, bootconfig_size: int, page: int) -> int:
-    """定位 bootconfig：位于 DTB 之后、按页对齐的最后一段。"""
-    if not bootconfig_size:
-        return after
-    candidates = [align(after, page), after, len(data) - bootconfig_size]
-    for candidate in candidates:
-        if after <= candidate <= len(data) - bootconfig_size:
-            return candidate
-    return max(0, len(data) - bootconfig_size)
-
-
 def _pack_vendor_boot(img: PackedImage) -> bytes:
     page = img.page_size
     header_size = VENDOR_BOOT_HEADER_SIZES.get(img.header_version, 2112)
@@ -451,63 +536,61 @@ def _pack_vendor_boot(img: PackedImage) -> bytes:
     _pad_to_page(out, page)
 
     ramdisk = img.segment("vendor_ramdisk")
-    ramdisk_off = len(out)
-    ramdisk_size = ramdisk.size if ramdisk else 0
     if ramdisk is not None:
+        ramdisk.offset = len(out)
         out.extend(ramdisk.data)
-        ramdisk.offset = ramdisk_off
-
-    _put_u32le(out, 24, ramdisk_size)
+    _put_u32le(out, 24, ramdisk.size if ramdisk else 0)
 
     dtb = img.segment("dtb")
-    dtb_size = dtb.size if dtb else 0
+    _put_u32le(out, 2100, dtb.size if dtb else 0)
+    _put_u64le(out, 2104, img.meta.get("dtb_addr", 0))
 
     if img.header_version == 4:
         entry_size = img.meta.get("table_entry_size", VENDOR_RAMDISK_TABLE_ENTRY_SIZE_V4)
-        fragments = [s for s in img.segments if s.name.startswith("ramdisk_fragment_")]
-        table = bytearray()
-        for seg in fragments:
-            table.extend(struct.pack("<III", seg.size, 0, seg.meta.get("type", VENDOR_RAMDISK_TYPE_NONE)))
-            table.extend(seg.meta.get("name_raw", b"\x00" * VENDOR_RAMDISK_NAME_SIZE).ljust(VENDOR_RAMDISK_NAME_SIZE, b"\x00")[:VENDOR_RAMDISK_NAME_SIZE])
-            table.extend(seg.meta.get("board_raw", b"\x00" * 64).ljust(64, b"\x00")[:64])
-            if len(table) % entry_size:
-                table.extend(b"\x00" * (entry_size - len(table) % entry_size))
-        table_off = len(out)
-        out.extend(table)
-        # 回填 fragment offset
-        for i, seg in enumerate(fragments):
-            _pad_to_page(out, page)
-            struct.pack_into("<I", out, table_off + i * entry_size + 4, len(out))
+        # 按原始布局顺序写 table / fragments / dtb / bootconfig
+        # （兼容 AOSP 布局与部分厂商的 table 在 dtb 之后的布局）
+        body = [s for s in img.segments
+                if s.name == "vendor_ramdisk_table"
+                or (s.name.startswith("ramdisk_fragment_") and s.size > 0)
+                or s.name == "dtb" or s.name == "bootconfig"]
+        table_follows_ramdisk = img.meta.get("table_follows_ramdisk", False)
+        ramdisk_end = (ramdisk.offset + ramdisk.size) if ramdisk is not None else len(out)
+
+        table_position: Optional[int] = None
+        fragment_patches: list[tuple[int, int]] = []
+        for seg in body:
+            is_table = seg.name == "vendor_ramdisk_table"
+            follows_ramdisk = (is_table and table_follows_ramdisk and len(out) == ramdisk_end)
+            if not follows_ramdisk:
+                _pad_to_page(out, page)
             seg.offset = len(out)
+            if is_table:
+                table_position = len(out)
+            elif seg.name.startswith("ramdisk_fragment_"):
+                try:
+                    index = int(seg.name.rsplit("_", 1)[1])
+                except ValueError:
+                    index = len(fragment_patches)
+                fragment_patches.append((index, len(out)))
+            elif seg.name == "bootconfig":
+                _put_u32le(out, 2124, seg.size)
             out.extend(seg.data)
 
-        if dtb is not None and dtb.data:
-            _pad_to_page(out, page)
-            dtb.offset = len(out)
-            out.extend(dtb.data)
-        _pad_to_page(out, page)
-
-        bootconfig = img.segment("bootconfig")
-        if bootconfig is not None and bootconfig.data:
-            bootconfig.offset = len(out)
-            out.extend(bootconfig.data)
-            _put_u32le(out, 2124, bootconfig.size)
-        else:
-            _put_u32le(out, 2124, 0)
-
-        _put_u32le(out, 2112, len(table))
-        _put_u32le(out, 2116, len(fragments))
-        _put_u32le(out, 2120, entry_size)
+        # 把 fragments 的新位置回填到表项中
+        if table_position is not None:
+            for index, new_offset in fragment_patches:
+                patch_at = table_position + index * entry_size + 4
+                if 0 <= patch_at + 4 <= len(out):
+                    struct.pack_into("<I", out, patch_at, new_offset)
     else:
         if dtb is not None and dtb.data:
             _pad_to_page(out, page)
             dtb.offset = len(out)
             out.extend(dtb.data)
-        _pad_to_page(out, page)
 
-    _put_u32le(out, 2100, dtb_size)
-    _put_u64le(out, 2104, img.meta.get("dtb_addr", 0))
+    # 尾部（vbmeta / 0 填充 / AVB footer 等）原样追加
     _pad_to_page(out, page)
+    out.extend(img.trailer)
     return bytes(out)
 
 
@@ -532,6 +615,7 @@ def _parse_dtbo(data: bytes) -> PackedImage:
     img.meta["entry_size"] = entry_size
     img.meta["entries_offset"] = entries_offset
 
+    last_end = 0
     for i in range(entry_count):
         base = entries_offset + i * entry_size
         if base + DTBO_ENTRY_SIZE > len(data):
@@ -543,6 +627,13 @@ def _parse_dtbo(data: bytes) -> PackedImage:
         img.segments.append(Segment(
             "dtb_%d" % i, bytes(data[dt_offset:dt_offset + dt_size]), dt_offset,
             meta={"id": dt_id, "rev": dt_rev, "custom": custom}))
+        last_end = max(last_end, dt_offset + dt_size)
+
+    # chunks 按页填充后的尾部数据原样保留
+    if last_end and img.page_size:
+        tail_start = align(last_end, img.page_size)
+        if tail_start < len(data):
+            img.trailer = bytes(data[tail_start:])
     return img
 
 
@@ -554,6 +645,9 @@ def _parse_raw_dtb(data: bytes) -> PackedImage:
         raise ImageError("未找到 DTB 数据")
     for i, (offset, size) in enumerate(spans):
         img.segments.append(Segment("dtb_%d" % i, bytes(data[offset:offset + size]), offset))
+    last_end = spans[-1][0] + spans[-1][1]
+    if last_end < len(data):
+        img.trailer = bytes(data[last_end:])
     return img
 
 
@@ -580,17 +674,18 @@ def _pack_dtbo(img: PackedImage) -> bytes:
         chunks.extend(b"\x00" * (padded - seg.size))
         cursor += padded
 
-    total = first_chunk + len(chunks)
+    total = first_chunk + len(chunks) + len(img.trailer)
     out = bytearray(total)
     struct.pack_into(">8I", out, 0, DTBO_MAGIC, total, header_size, entry_size,
                      len(img.segments), entries_offset, page, 0)
     out[entries_offset:entries_offset + len(entries)] = entries
     out[first_chunk:first_chunk + len(chunks)] = chunks
+    out[first_chunk + len(chunks):] = img.trailer
     return bytes(out)
 
 
 def _pack_raw_dtb(img: PackedImage) -> bytes:
-    return b"".join(seg.data for seg in img.segments)
+    return b"".join(seg.data for seg in img.segments) + img.trailer
 
 
 # ---------------------------------------------------------------------------

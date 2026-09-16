@@ -42,6 +42,9 @@ class DtbSlot:
     fdt: Optional[Fdt] = None
     table: Optional[GpuTable] = None
     error: str = ""
+    #: 是否被编辑过；未编辑的槽位保存时原样输出原始字节，
+    #: 保证与源镜像字节级一致（设备树的字符串表组织方式可能与序列化器不同）。
+    dirty: bool = False
 
     @property
     def editable(self) -> bool:
@@ -267,6 +270,7 @@ class Session:
             self.history.pop(0)
         self.redo_stack.clear()
         self.modified = True
+        slot.dirty = True
         self._refresh_slot(slot)
         return True
 
@@ -463,34 +467,40 @@ class Session:
             return "%s_modified%s" % (stem, suffix)
         return "%s_modified%s" % (stem, suffix)
 
+    def _slot_bytes(self, slot: DtbSlot) -> bytes:
+        """槽位的当前内容：未修改的槽位返回原始字节，编辑过的重新序列化。"""
+        if slot.fdt is None or not slot.dirty:
+            return slot.data
+        return slot.fdt.to_bytes()
+
     def _build_image(self) -> bytes:
         image = self.image
         if image is None:
             raise SessionError("没有可导出的镜像")
 
-        # 内核内嵌 DTB：统一重建 kernel 段
+        # 内核内嵌 DTB：统一重建 kernel 段（仅当有修改时）
         if self.kernel_info is not None:
             kernel_seg = image.segment("kernel")
             if kernel_seg is not None:
                 replacements: dict[int, bytes] = {}
                 for slot in self.slots:
-                    if slot.kernel_index >= 0 and slot.fdt is not None:
+                    if slot.kernel_index >= 0 and slot.dirty and slot.fdt is not None:
                         replacements[slot.kernel_index] = slot.fdt.to_bytes()
                 if replacements:
                     kernel_seg.data = kernel_dtb.replace_fdts_in_kernel(
                         self.kernel_info, replacements)
 
-        # dtb 段（可能由多个 DTB 拼接）
-        dtb_slots = [s for s in self.slots if s.segment_name == "dtb" and s.fdt is not None]
-        if dtb_slots:
+        # dtb 段（可能由多个 DTB 拼接；未修改的槽位保持原始字节）
+        dtb_slots = [s for s in self.slots if s.segment_name == "dtb"]
+        if dtb_slots and any(s.dirty for s in dtb_slots):
             seg = image.segment("dtb")
             if seg is not None:
-                seg.data = b"".join(s.fdt.to_bytes() for s in dtb_slots)
+                seg.data = b"".join(self._slot_bytes(s) for s in dtb_slots)
 
         # dtbo 条目
         if image.kind == ImageKind.DTBO:
             for slot in self.slots:
-                if slot.fdt is None:
+                if slot.fdt is None or not slot.dirty:
                     continue
                 seg = image.segment(slot.segment_name)
                 if seg is not None:
@@ -499,22 +509,14 @@ class Session:
         return image.pack()
 
     def _build_dtb_file(self) -> bytes:
-        chunks: list[bytes] = []
-        for slot in self.slots:
-            chunks.append(self._serialize_slot(slot))
-        return b"".join(chunks)
+        return b"".join(self._slot_bytes(slot) for slot in self.slots) + (
+            self.image.trailer if self.image is not None else b"")
 
     def _build_dts_text(self) -> str:
         slot = self.current_slot
         if slot is None or slot.fdt is None:
             raise SessionError("没有可导出的设备树")
         return dts.fdt_to_dts(slot.fdt)
-
-    def _serialize_slot(self, slot: DtbSlot) -> bytes:
-        """把槽位的当前设备树序列化为字节。"""
-        if slot.fdt is None:
-            return slot.data
-        return slot.fdt.to_bytes()
 
     def save(self, path: str) -> None:
         data = self.build_output()
@@ -533,7 +535,7 @@ class Session:
         slot = self.current_slot
         if slot is None or slot.fdt is None:
             raise SessionError("没有可导出的设备树")
-        Path(path).write_bytes(slot.fdt.to_bytes())
+        Path(path).write_bytes(self._slot_bytes(slot))
 
     # -- 配置（调参方案）导入导出 -----------------------------------------
 

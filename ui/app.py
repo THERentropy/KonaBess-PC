@@ -360,12 +360,20 @@ class MainWindow(tk.Tk):
                 partition = "vendor_boot"
             elif "dtbo" in name:
                 partition = "dtbo"
+
+            avb_note = ""
+            trailer = session.image.trailer if session.image is not None else b""
+            if len(trailer) >= 64 and b"AVBf" in trailer[-64:]:
+                avb_note = ("\n\n注意: 原镜像带有 AVB 签名（已原样保留在文件尾部），"
+                            "但你修改了镜像内容，签名校验将不匹配。\n"
+                            "若设备开启了启动验证且刷入后无法开机，请刷回原镜像。")
+
             messagebox.showinfo(
                 "保存完成",
                 "已生成输出文件:\n%s\n\n请确认文件无误后刷入设备：\n\n"
                 "  fastboot flash %s %s\n\n"
-                "刷机前建议先备份原分区，并确保已解锁 Bootloader。"
-                % (path, partition, os.path.basename(path)),
+                "刷机前建议先备份原分区，并确保已解锁 Bootloader。%s"
+                % (path, partition, os.path.basename(path), avb_note),
                 parent=self)
         else:
             messagebox.showinfo("保存完成", "已导出:\n%s" % path, parent=self)

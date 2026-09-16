@@ -7,7 +7,7 @@
 3. 导出可刷入的镜像（fastboot flash）
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __app_name__ = "KonaBess PC"
 
 __all__ = ["__version__", "__app_name__"]
