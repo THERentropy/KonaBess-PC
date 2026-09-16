@@ -92,12 +92,12 @@ def main() -> int:
     if not EXE.exists():
         raise SystemExit("未找到 %s，请先运行 build_exe.ps1 打包。" % EXE)
     size_mb = EXE.stat().st_size / 1048576
-    print("附件: %s (%.2f MB)" % (EXE.name, size_mb))
+    print("本地附件: %s (%.2f MB, %s)"
+          % (EXE.name, size_mb, EXE.stat().st_mtime))
 
     token = get_token()
     print("已获取 GitHub 凭据")
 
-    # 1. 创建 Release（同时创建 tag）
     payload = {
         "tag_name": TAG,
         "target_commitish": "main",
@@ -106,22 +106,57 @@ def main() -> int:
         "draft": False,
         "prerelease": False,
     }
+
+    # 1. 若该 tag 的 Release 已存在则更新说明，否则创建（幂等）
+    existing = None
     try:
-        status, release = api_request(
-            "https://api.github.com/repos/%s/releases" % REPO, token,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST")
+        _status, existing = api_request(
+            "https://api.github.com/repos/%s/releases/tags/%s" % (REPO, TAG), token)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit("创建 Release 失败 (HTTP %d): %s" % (exc.code, body))
+        if exc.code != 404:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise SystemExit("查询 Release 失败 (HTTP %d): %s" % (exc.code, body))
 
-    print("Release 已创建: %s (id=%s), tag=%s" % (release["html_url"], release["id"], TAG))
+    if existing is not None:
+        try:
+            _status, release = api_request(
+                "https://api.github.com/repos/%s/releases/%s" % (REPO, existing["id"]), token,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise SystemExit("更新 Release 失败 (HTTP %d): %s" % (exc.code, body))
+        print("Release 已存在，已更新说明: %s" % release["html_url"])
+    else:
+        try:
+            _status, release = api_request(
+                "https://api.github.com/repos/%s/releases" % REPO, token,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise SystemExit("创建 Release 失败 (HTTP %d): %s" % (exc.code, body))
+        print("Release 已创建: %s (id=%s), tag=%s" % (release["html_url"], release["id"], TAG))
 
-    # 2. 上传 exe 附件
+    # 2. 删除同名旧附件（避免下载到过期文件）
+    for asset in release.get("assets", []):
+        if asset["name"] == EXE.name:
+            try:
+                api_request(
+                    "https://api.github.com/repos/%s/releases/assets/%s" % (REPO, asset["id"]),
+                    token, method="DELETE")
+                print("已删除旧附件: %s (%.2f MB, 上传于 %s)"
+                      % (asset["name"], asset["size"] / 1048576, asset["created_at"]))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise SystemExit("删除旧附件失败 (HTTP %d): %s" % (exc.code, body))
+
+    # 3. 上传新附件
     upload_url = release["upload_url"].split("{")[0]
     try:
-        status, asset = api_request(
+        _status, asset = api_request(
             "%s?name=%s" % (upload_url, EXE.name), token,
             data=EXE.read_bytes(),
             headers={"Content-Type": "application/octet-stream"},
@@ -133,7 +168,7 @@ def main() -> int:
     print("附件已上传: %s (%.2f MB)" % (asset["browser_download_url"],
                                         asset["size"] / 1048576))
     print()
-    print("发布完成: %s" % release["html_url"])
+    print("完成: %s" % release["html_url"])
     return 0
 
 
