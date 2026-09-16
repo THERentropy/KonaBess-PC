@@ -166,5 +166,3 @@ python tests/test_ui.py       # 界面冒烟测试
 
 - **KonaBess 原作者**：[libxzr](https://github.com/libxzr) —— 原始创意与实现
 - **KonaBess Next**：[KonaBess-Next/KonaBess-Next](https://github.com/KonaBess-Next/KonaBess-Next) —— 本项目的参考实现（电压档位表、芯片识别逻辑、编辑模型均参考自该项目）
-
-> `_reference/` 目录为参考项目的源码副本，仅用于对照与测试，可安全删除。
